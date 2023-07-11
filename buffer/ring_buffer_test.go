@@ -94,3 +94,29 @@ func TestWriteAtInOrderLap(t *testing.T) {
 		}
 	}
 }
+
+func TestWriteAtReverseOrderNoLap(t *testing.T) {
+	writerCount := 5
+	size := writerCount * (writerCount + 1) / 2
+	offset := 64
+	rb := buffer.NewRing(size, offset, int64(size))
+
+	// put items in reverse order
+	for i := 1; i <= size; i++ {
+		_, err := rb.WriteAt(fillAndReturn(size-i, offset), int64(offset*(size-i)))
+		if err != nil {
+			t.Errorf("Error while writing the chunk\n")
+		}
+	}
+
+	// expect to have them in right order
+	for i := 1; i <= size; i++ {
+		rb.Read()
+		chunk := <-rb.Items
+		expected := fillAndReturn(i-1, offset)
+
+		if !bytes.Equal(chunk, expected) {
+			t.Errorf("Got %v, expected: %v\n", chunk, expected)
+		}
+	}
+}

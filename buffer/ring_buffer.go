@@ -68,7 +68,7 @@ func (rb *RingBuffer) Read() {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 
-	if rb.r != rb.w || (rb.r.Value != nil && rb.rc == 0) || rb.wc-rb.rc <= rb.bufferSize {
+	if rb.r != rb.w || (rb.r.Value != nil && rb.rc == 0) || (rb.wc-rb.rc <= rb.bufferSize && rb.r.Value != nil) {
 		defer func() {
 			// flush the item
 			rb.r.Value = nil
