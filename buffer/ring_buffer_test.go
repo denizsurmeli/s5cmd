@@ -3,17 +3,16 @@ package buffer_test
 import (
 	"bytes"
 	"math"
+	"math/rand"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/peak/s5cmd/v2/buffer"
+	"gotest.tools/v3/assert"
 )
 
-type WriteAtCase struct {
-	Order  []int
-	Offset int
-}
-
-func fillAndReturn(n, size int) []byte {
+func makeChunk(n, size int) []byte {
 	chunk := make([]byte, size)
 	for i := 0; i < size; i++ {
 		chunk[i] = byte(n)
@@ -25,98 +24,235 @@ func calculateChunkCount(filesize, width int) int64 {
 	return int64(math.Ceil(float64(filesize / width)))
 }
 
-func TestWriteAtInOrderNoLap(t *testing.T) {
-	writerCount := 5
-	size := writerCount * (writerCount + 1) / 2
-	offset := 64
-
-	rb := buffer.NewRing(size, offset, int64(size))
-	for i := 1; i <= size; i++ {
-		chunk := fillAndReturn(i, offset)
-		_, err := rb.WriteAt(chunk, int64(offset*(i-1)))
-		if err != nil {
-			t.Errorf("Error while writing chunk\n")
+func bufferDrainer(t *testing.T, rb *buffer.RingBuffer, offset int) {
+	// drain
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for {
+			time.Sleep(time.Millisecond * 50)
+			done := rb.ReadAvailableChunks()
+			if done {
+				t.Logf("Read all chunks.\n")
+				break
+			}
 		}
-	}
-
-	for i := 1; i <= size; i++ {
-		rb.Read()
-		chunk := <-rb.Items
-		expected := fillAndReturn(i, offset)
-		if !bytes.Equal(chunk, expected) {
-			t.Errorf("Got %v, expected: %v\n", chunk, expected)
+	}()
+	go func() {
+		defer wg.Done()
+		i := 0
+		for chunk := range rb.Items {
+			expected := makeChunk(i, offset)
+			t.Logf("Chunk:%v\n", chunk)
+			if !bytes.Equal(chunk, expected) {
+				t.Errorf("Got %v, expected: %v", chunk, expected)
+			}
+			i++
 		}
-	}
+	}()
+
+	wg.Wait()
 }
 
-func TestWriteAtInOrderLap(t *testing.T) {
-	writerCount := 5
-	size := writerCount * (writerCount + 1) / 2
-	offset := 64
-	rb := buffer.NewRing(size, offset, int64(size))
+// Allocate gbs, fill whole, write seq, expect ordered seq
+func TestSequentialWrite(t *testing.T) {
+	offset, workerCount := 64, 5
+	//guaranteed buffer size
+	gbs := workerCount * (workerCount + 1) / 2
+	rb := buffer.NewRingBuffer(gbs, workerCount, offset)
 
-	// first round, lap 0
-	for i := 1; i <= size; i++ {
-		_, err := rb.WriteAt(fillAndReturn(i, offset), int64(offset*(i-1)))
-		if err != nil {
-			t.Errorf("Error while writing the chunk\n")
-		}
-	}
-	// drain the channel
-	for i := 1; i <= size; i++ {
-		rb.Read()
-		<-rb.Items
+	// nolap
+	for i := 0; i < workerCount; i++ {
+		off := int64(i * offset)
+		chunk := makeChunk(i, offset)
+		rb.WriteAt(chunk, off)
 	}
 
-	// reopen the channel, since you have closed by reading all the chunks
-	// this never happens when you concurrently both write and read,
-	// the purpose of this test to is the behaviour as expected
-	// when we lap in the buffer.
-	rb.Items = make(chan []byte, size)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		bufferDrainer(t, rb, offset)
+	}()
+	wg.Wait()
 
-	// second round, lap 1
-	for i := 1; i <= size; i++ {
-		_, err := rb.WriteAt(fillAndReturn(i+size, offset), int64(offset*(i+size-1)))
-		if err != nil {
-			t.Errorf("Error while writing the chunk\n")
-		}
+	// fill buffer at worst case
+	chunks := workerCount * (workerCount + 1) / 2
+	rb = buffer.NewRingBuffer(gbs, chunks, offset)
 
+	// nolap
+	for i := 0; i < chunks; i++ {
+		off := int64(i * offset)
+		chunk := makeChunk(i, offset)
+		rb.WriteAt(chunk, off)
 	}
 
-	// read size items
-	for i := 1; i <= size; i++ {
-		rb.Read()
-		chunk := <-rb.Items
-		expected := fillAndReturn(size+i, offset)
-
-		if !bytes.Equal(chunk, expected) {
-			t.Errorf("Got %v, expected: %v\n", chunk, expected)
-		}
-	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		bufferDrainer(t, rb, offset)
+	}()
+	wg.Wait()
 }
 
-func TestWriteAtReverseOrderNoLap(t *testing.T) {
-	writerCount := 5
-	size := writerCount * (writerCount + 1) / 2
-	offset := 64
-	rb := buffer.NewRing(size, offset, int64(size))
+// Allocate gbs, fill whole, write random, expect ordered seq
+func TestRandomWrite(t *testing.T) {
+	offset, workerCount := 64, 5
+	// chunks := workerCount * (workerCount + 1) / 2
+	//guaranteed buffer size
+	gbs := workerCount * (workerCount + 1) / 2
+	rb := buffer.NewRingBuffer(gbs, workerCount, offset)
 
-	// put items in reverse order
-	for i := 1; i <= size; i++ {
-		_, err := rb.WriteAt(fillAndReturn(size-i, offset), int64(offset*(size-i)))
-		if err != nil {
-			t.Errorf("Error while writing the chunk\n")
-		}
+	// make a shuffled array - nolap
+	for _, i := range rand.Perm(workerCount) {
+		off := int64(i * offset)
+		rb.WriteAt(makeChunk(i, offset), off)
 	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		bufferDrainer(t, rb, offset)
+	}()
+	wg.Wait()
 
-	// expect to have them in right order
-	for i := 1; i <= size; i++ {
-		rb.Read()
-		chunk := <-rb.Items
-		expected := fillAndReturn(i-1, offset)
+	// fill buffer at worst case
+	chunks := workerCount * (workerCount + 1) / 2
+	rb = buffer.NewRingBuffer(gbs, chunks, offset)
 
-		if !bytes.Equal(chunk, expected) {
-			t.Errorf("Got %v, expected: %v\n", chunk, expected)
-		}
+	// make a shuffled array - nolap
+	for _, i := range rand.Perm(chunks) {
+		off := int64(i * offset)
+		rb.WriteAt(makeChunk(i, offset), off)
 	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		bufferDrainer(t, rb, offset)
+	}()
+	wg.Wait()
 }
+
+// Allocate gbs, fill except the head,read nothing
+// after 50 ms, put head, expect seq full read.
+func TestBlockingHeadSequentialWrite(t *testing.T) {
+	offset, workerCount := 64, 5
+	//guaranteed buffer size
+	gbs := workerCount * (workerCount + 1) / 2
+	rb := buffer.NewRingBuffer(gbs, workerCount, offset)
+
+	// all except first chunk
+	for i := 1; i < workerCount; i++ {
+		off := int64(i * offset)
+		chunk := makeChunk(i, offset)
+		rb.WriteAt(chunk, off)
+	}
+
+	isComplete := rb.ReadAvailableChunks()
+	assert.Equal(t, isComplete, false, "buffer says it has read all chunks, head chunk is missing")
+	assert.Equal(t, len(rb.Items), 0, "buffer must have empty channel but it has items ")
+
+	// give the missing chunk, write at offset 0
+	rb.WriteAt(makeChunk(0, offset), int64(0))
+	// expect all items to be completed and read from the channel
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		bufferDrainer(t, rb, offset)
+	}()
+	wg.Wait()
+
+	// fill the buffer
+	chunks := workerCount * (workerCount + 1) / 2
+	rb = buffer.NewRingBuffer(gbs, chunks, offset)
+
+	// nolap
+	for i := 1; i < chunks; i++ {
+		off := int64(i * offset)
+		chunk := makeChunk(i, offset)
+		rb.WriteAt(chunk, off)
+	}
+
+	isComplete = rb.ReadAvailableChunks()
+	assert.Equal(t, isComplete, false, "buffer says it has read all chunks, head chunk is missing")
+	assert.Equal(t, len(rb.Items), 0, "buffer must have empty channel but it has items ")
+
+	// give the missing chunk, write at offset 0
+	rb.WriteAt(makeChunk(0, offset), int64(0))
+	// expect all items to be completed and read from the channel
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		bufferDrainer(t, rb, offset)
+	}()
+	wg.Wait()
+
+}
+
+// Allocate gbs, fill except the head,read nothing
+// after 50 ms, put head, expect seq full read.
+func TestBlockingRandomWrite(t *testing.T) {
+	offset, workerCount := 64, 5
+	// chunks := workerCount * (workerCount + 1) / 2
+	//guaranteed buffer size
+	gbs := workerCount * (workerCount + 1) / 2
+	rb := buffer.NewRingBuffer(gbs, workerCount, offset)
+
+	// all except first chunk
+	for _, i := range rand.Perm(workerCount) {
+		// skip the head chunk
+		if i != 0 {
+			off := int64(i * offset)
+			chunk := makeChunk(i, offset)
+			rb.WriteAt(chunk, off)
+		}
+	}
+
+	isComplete := rb.ReadAvailableChunks()
+	assert.Equal(t, isComplete, false, "buffer says it has read all chunks, head chunk is missing")
+	assert.Equal(t, len(rb.Items), 0, "buffer must have empty channel but it has items ")
+
+	// give the missing chunk, write at offset 0
+	rb.WriteAt(makeChunk(0, offset), int64(0))
+	// expect all items to be completed and read from the channel
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		bufferDrainer(t, rb, offset)
+	}()
+	wg.Wait()
+
+	// fill the buffer
+	chunks := workerCount * (workerCount + 1) / 2
+	rb = buffer.NewRingBuffer(gbs, chunks, offset)
+
+	// nolap
+	for _, i := range rand.Perm(chunks) {
+		// skip the head chunk
+		if i != 0 {
+			off := int64(i * offset)
+			chunk := makeChunk(i, offset)
+			rb.WriteAt(chunk, off)
+		}
+	}
+
+	isComplete = rb.ReadAvailableChunks()
+	assert.Equal(t, isComplete, false, "buffer says it has read all chunks, head chunk is missing")
+	assert.Equal(t, len(rb.Items), 0, "buffer must have empty channel but it has items ")
+
+	// give the missing chunk, write at offset 0
+	rb.WriteAt(makeChunk(0, offset), int64(0))
+	// expect all items to be completed and read from the channel
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		bufferDrainer(t, rb, offset)
+	}()
+	wg.Wait()
+}
+
+// Allocate gbs, fill with gaps, read piece by piece
+// at the end, expect all pieces sequentially.

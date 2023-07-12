@@ -4,6 +4,7 @@ package buffer
 import (
 	"container/ring"
 	"errors"
+	"fmt"
 	"sync"
 )
 
@@ -18,89 +19,96 @@ var (
 // implementing thread-safe operations and
 // writeAt functionality.
 type RingBuffer struct {
-	r          *ring.Ring // next ptr to read
-	w          *ring.Ring // next ptr to write
-	start      *ring.Ring // lap ptr
-	wc         int        // number of writes to the buffer
-	rc         int        // number of reads from the buffer
-	lap        int        // number of laps in the ring
-	bufferSize int        // concurrent writers * (concurrent writers + 1) / 2
-	offsetSize int        // part size
-	chunks     int64      // expected total chunk count
-	mu         sync.Mutex
-
-	Items chan []byte
+	r           *ring.Ring // next pointer to read
+	w           *ring.Ring // next pointer to write
+	start       *ring.Ring // pointer for tracking the lapping
+	wc          int        // number of writes to the buffer
+	rc          int        // number of reades from the buffer
+	size        int        // size of the buffer
+	offsetWidth int        // offset width is used for calculating indexes
+	chunks      int        // expected number of chunks to be written to buffer
+	mu          *sync.Mutex
+	waitCond    *sync.Cond  // condition to read&write
+	fullCond    *sync.Cond  // condition to signal buffer state
+	Items       chan []byte // processed items will be passed to this channel
 }
 
-func (rb *RingBuffer) IsFull() bool {
-	rb.mu.Lock()
-	defer rb.mu.Unlock()
-
-	return rb.r == rb.w && rb.wc != 0
-}
-
-func (rb *RingBuffer) WriteAt(p []byte, off int64) (int, error) {
-	rb.mu.Lock()
-	defer rb.mu.Unlock()
-	if rb.wc > 0 && rb.wc%rb.bufferSize == 0 {
-		rb.lap++
-	}
-	if rb.r != rb.w || (rb.wc == 0 && rb.w == rb.r) || rb.wc-rb.rc <= rb.bufferSize {
-		index := (int(off) - (rb.lap * rb.bufferSize * rb.offsetSize)) / rb.offsetSize
-		var temp *ring.Ring
-		if index == 0 {
-			temp = rb.w
-		} else {
-			temp = rb.w
-			for index > 0 {
-				temp = temp.Next()
-				index--
-			}
-		}
-		temp.Value = p
-		rb.wc += 1
-		return rb.offsetSize, nil
-	}
-	return 0, bufferFull
-}
-
-func (rb *RingBuffer) Read() {
-	rb.mu.Lock()
-	defer rb.mu.Unlock()
-
-	if rb.r != rb.w || (rb.r.Value != nil && rb.rc == 0) || (rb.wc-rb.rc <= rb.bufferSize && rb.r.Value != nil) {
-		defer func() {
-			// flush the item
-			rb.r.Value = nil
-			rb.r = rb.r.Next()
-		}()
-		if rb.r.Value != nil {
-			rb.rc += 1
-			rb.Items <- rb.r.Value.([]byte)
-		}
-	}
-
-	if rb.rc == int(rb.chunks) {
-		// you are done, close the channel
-		close(rb.Items)
-	}
-}
-
-// The guaranteed buffer size is (workerCount * (workerCount + 1) / 2)
-func NewRing(size int, offsetSize int, fileSize int64) *RingBuffer {
+func NewRingBuffer(size, chunks, offsetWidth int) *RingBuffer {
 	r := ring.New(size)
-	rb := &RingBuffer{
-		r:          r,
-		w:          r,
-		start:      r,
-		mu:         sync.Mutex{},
-		rc:         0,
-		wc:         0,
-		lap:        0,
-		bufferSize: size,
-		offsetSize: offsetSize,
-		chunks:     fileSize,
-		Items:      make(chan []byte, size)}
+	mu := &sync.Mutex{}
+	return &RingBuffer{
+		r:           r,
+		w:           r,
+		start:       r,
+		wc:          0,
+		rc:          0,
+		size:        size,
+		offsetWidth: offsetWidth,
+		chunks:      chunks,
+		mu:          mu,
+		waitCond:    sync.NewCond(mu),
+		fullCond:    sync.NewCond(mu),
+		Items:       make(chan []byte, size),
+	}
+}
 
-	return rb
+func (rb *RingBuffer) WriteAt(p []byte, offset int64) (int, error) {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+
+	// the buffer is full, wait for it to drain
+	for rb.wc%rb.size == 0 && rb.wc != 0 {
+		rb.fullCond.Wait()
+	}
+
+	// lap can be calculated as follows: the write count / buffer size
+	// gives the lap, so wc/size floored is sufficient.
+
+	lap := rb.wc / rb.size
+	index := (offset - int64(lap*rb.offsetWidth*rb.size)) / int64(rb.offsetWidth)
+
+	ptr := rb.w.Move(int(index))
+	// there is a value that has not been yet read, wait
+	for ptr.Value != nil {
+		rb.waitCond.Wait()
+	}
+	ptr.Value = &p
+
+	rb.wc++
+
+	return len(p), nil
+}
+
+// Reads the next available chunks and writes to channel
+func (rb *RingBuffer) ReadAvailableChunks() bool {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+
+	for {
+		ptr := rb.r.Value
+		if ptr == nil {
+			break
+		}
+		value := ptr.(*[]byte)
+		rb.r.Value = nil
+		rb.r = rb.r.Next()
+		// if there is a writer in the queue that waits for this
+		// index to be emptied, signal it to proceed
+		rb.waitCond.Signal()
+		rb.rc++
+		fmt.Printf("Writing :%v\n", *value)
+		rb.Items <- *value
+		// all chunks have been written and read from the buffer, close the channel
+		if rb.rc == rb.chunks {
+			close(rb.Items)
+			return true
+		}
+	}
+	// if the buffer was full, it has drained, signal writers
+	if rb.wc%rb.size == 0 && rb.wc != 0 {
+		rb.fullCond.Broadcast()
+	}
+
+	return false
+
 }
