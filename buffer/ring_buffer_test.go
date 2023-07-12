@@ -256,3 +256,45 @@ func TestBlockingRandomWrite(t *testing.T) {
 
 // Allocate gbs, fill with gaps, read piece by piece
 // at the end, expect all pieces sequentially.
+func TestBlockingGapsSequentially(t *testing.T) {
+	offset, workerCount := 64, 5
+	// chunks := workerCount * (workerCount + 1) / 2
+	//guaranteed buffer size
+	gbs := workerCount * (workerCount + 1) / 2
+	rb := buffer.NewRingBuffer(gbs, workerCount, offset)
+
+	// you have 5 workers, so 5 chunks expected at the buffer, 0 index
+	// is the head chunk
+	// fill 1,2
+	for i := 1; i <= 2; i++ {
+		off := int64(i * offset)
+		chunk := makeChunk(i, offset)
+		rb.WriteAt(chunk, off)
+	}
+
+	// assert no read, no item, no end
+	isComplete := rb.ReadAvailableChunks()
+	assert.Equal(t, isComplete, false, "buffer says it has read all chunks, head chunk is missing")
+	assert.Equal(t, len(rb.Items), 0, "buffer must have empty channel but it has items ")
+	// fill 3,4
+	for i := 3; i <= 4; i++ {
+		off := int64(i * offset)
+		chunk := makeChunk(i, offset)
+		rb.WriteAt(chunk, off)
+	}
+	// asssert no read, no item, no end
+	isComplete = rb.ReadAvailableChunks()
+	assert.Equal(t, isComplete, false, "buffer says it has read all chunks, head chunk is missing")
+	assert.Equal(t, len(rb.Items), 0, "buffer must have empty channel but it has items ")
+
+	// give the missing chunk
+	rb.WriteAt(makeChunk(0, offset), int64(0))
+	// expect everything to be ok
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		bufferDrainer(t, rb, offset)
+	}()
+	wg.Wait()
+}
