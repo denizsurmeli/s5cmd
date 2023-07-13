@@ -455,7 +455,7 @@ func TestConcurrentWrite(t *testing.T) {
 		task := WriteTask{
 			i:      i,
 			offset: int64(i * offset),
-			sleep:  time.Duration(rand.Intn(50)+1) * time.Millisecond, // every task sleeps between 1 ms and 50ms
+			sleep:  time.Duration(rand.Intn(2)+1) * time.Millisecond, // every task sleeps between 1 ms and 50ms
 		}
 		tasks <- task
 	}

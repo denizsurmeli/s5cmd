@@ -9,6 +9,10 @@ import (
 	"sync"
 )
 
+var (
+	ioCopyChunkSize = 1024 * 32
+)
+
 // RingBuffer is a wrapper around the container/ring for
 // implementing thread-safe operations and
 // writeAt functionality.
@@ -58,8 +62,32 @@ func (rb *RingBuffer) WriteAt(p []byte, offset int64) (int, error) {
 		rb.rc++
 	}
 	ptr := rb.r.Move(int(index) - rb.rc%rb.size)
-	ptr.Value = p
-	rb.wc++
+	var off int64
+	var c []byte
+	// io.Copy coppies in 32kb chunks, this breaks the offset
+	// if it's a beginning part, set object
+	if offset%int64(rb.offsetWidth) == 0 {
+		// set buffer
+		if ptr.Value == nil {
+			rb.wc++
+			ptr.Value = make([]byte, rb.offsetWidth)
+		}
+		c, _ = ptr.Value.([]byte)
+		copy(c[:len(p)], p)
+
+	} else {
+		if ptr.Value == nil {
+			rb.wc++
+			ptr.Value = make([]byte, rb.offsetWidth)
+		}
+		c, _ = ptr.Value.([]byte)
+		off = offset % int64(ioCopyChunkSize)
+		copy(c[off:int(off)+len(p)], p)
+		// if I have the last tiny piece of the last offset, clean up the extra space
+	}
+	if (rb.Chunks-1)*rb.offsetWidth <= int(offset) && offset+int64(ioCopyChunkSize) >= int64(rb.Chunks)*int64(rb.offsetWidth) {
+		ptr.Value = c[:int(off)+len(p)]
+	}
 
 	// if you have written the all chunks, flush the buffer
 	if rb.wc == rb.Chunks {

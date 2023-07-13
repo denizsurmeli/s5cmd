@@ -2,12 +2,13 @@ package command
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"io"
 	"os"
 
 	"github.com/urfave/cli/v2"
 
+	"github.com/peak/s5cmd/v2/buffer"
 	"github.com/peak/s5cmd/v2/log/stat"
 	"github.com/peak/s5cmd/v2/storage"
 	"github.com/peak/s5cmd/v2/storage/url"
@@ -96,14 +97,42 @@ func (c Cat) Run(ctx context.Context) error {
 		return err
 	}
 
-	rc, err := client.Read(ctx, c.src)
+	workerCount := defaultCopyConcurrency
+	chunkSize := int64(megabytes * 32) // by default 64 mb chunks
+	// stat the object to correcty setup the buffer.
+	obj, err := client.Stat(ctx, c.src)
+
 	if err != nil {
 		printError(c.fullCommand, c.op, err)
 		return err
 	}
-	defer rc.Close()
 
-	_, err = io.Copy(os.Stdout, rc)
+	// objSize/chunkSize would floor, so if objSize % chunkSize != 0, add 1
+	// to expected chunk count.
+	expectedChunkCount := obj.Size / int64(chunkSize)
+	if obj.Size%int64(chunkSize) != 0 {
+		expectedChunkCount++
+	}
+	// the buffer size is calculated as follows:
+	// First of all, this structure is not deterministic, that is,
+	// the internal buffer size lowers the possibility of overriding the position
+	// before writing by allocating (wc * (wc+1) / 2) + wc slots, where
+	// wc is worker count.
+	bufferSize := int(expectedChunkCount)
+	buff := buffer.NewRingBuffer(bufferSize, int(expectedChunkCount), int(chunkSize), os.Stdout)
+
+	fmt.Printf("WorkerCount: %d bufferSize:%d expectedChunkCount:%d chunkSize:%d\n", workerCount, bufferSize, expectedChunkCount, chunkSize)
+	n, err := client.Get(ctx, c.src, buff, workerCount, chunkSize)
+	if err != nil {
+		printError(c.fullCommand, c.op, err)
+		return err
+	}
+
+	if n != obj.Size {
+		missingBytesError := errors.New("conccurency error, data is corrupt")
+		printError(c.fullCommand, c.op, missingBytesError)
+		return missingBytesError
+	}
 	if err != nil {
 		printError(c.fullCommand, c.op, err)
 		return err
