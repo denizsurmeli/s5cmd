@@ -1,4 +1,6 @@
-// A thread-safe ring buffer wrapper around the standard library.
+// A thread-safe ring buffer wrapper for the container ring.
+// This buffer is used for creating a adapter for io.Writer
+// interface.
 package buffer
 
 import (
@@ -41,10 +43,9 @@ func (rb *RingBuffer) WriteAt(p []byte, offset int64) (int, error) {
 	defer rb.mu.Unlock()
 	// lap can be calculated as follows: the write count / buffer size
 	// gives the lap, so wc/size floored is sufficient.
-	// lap := rb.wc / rb.size
-	// index := (offset - int64(lap*rb.offsetWidth*rb.size)) / int64(rb.offsetWidth)
+	lap := rb.wc / rb.size
+	index := (offset - int64(lap*rb.offsetWidth*rb.size)) / int64(rb.offsetWidth)
 	// write the things you can write
-	_rc := rb.rc
 	for {
 		val := rb.r.Value
 		if val == nil {
@@ -56,18 +57,18 @@ func (rb *RingBuffer) WriteAt(p []byte, offset int64) (int, error) {
 		rb.r = rb.r.Next()
 		rb.rc++
 	}
-	diff := rb.rc - _rc
-	rb.r = rb.r.Move(-diff)
-	rb.r.Value = p
+	ptr := rb.r.Move(int(index) - rb.rc%rb.size)
+	ptr.Value = p
 	rb.wc++
 
-	if rb.rc == rb.Chunks-1 {
+	// if you have written the all chunks, flush the buffer
+	if rb.wc == rb.Chunks {
 		for {
 			val := rb.r.Value
 			if val == nil {
 				break
 			}
-	
+
 			rb.w.Write(val.([]byte))
 			rb.r.Value = nil
 			rb.r = rb.r.Next()
