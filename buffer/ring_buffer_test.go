@@ -481,3 +481,84 @@ func TestConcurrentWrite(t *testing.T) {
 	}
 
 }
+
+// allocate gbs, test the last chunk with size
+// less than the offset
+func TestTinyChunk(t *testing.T) {
+	offset, workerCount := 64, 5
+	//guaranteed buffer size
+	gbs := (workerCount * (workerCount + 1) / 2) + workerCount
+	var result bytes.Buffer
+	expected := make([]byte, 0)
+	rb := buffer.NewRingBuffer(gbs, workerCount, offset, &result)
+
+	// nolap
+	for i := 0; i < workerCount-1; i++ {
+		off := int64(i * offset)
+		chunk := makeChunk(i, offset)
+		rb.WriteAt(chunk, off)
+		expected = append(expected, chunk...)
+	}
+
+	// make the last chunk tiny
+	miniChunk := makeChunk(workerCount, offset/2)
+	off := int64(offset * (workerCount - 1))
+
+	expected = append(expected, miniChunk...)
+	rb.WriteAt(miniChunk, off)
+
+	if !bytes.Equal(result.Bytes(), expected) {
+		t.Errorf("Got: %v, expected: %v\n", result.Bytes(), expected)
+	}
+
+	// fill buffer at worst case
+	chunks := workerCount*(workerCount+1)/2 + workerCount
+	result.Reset()
+	rb = buffer.NewRingBuffer(gbs, chunks, offset, &result)
+	expected = make([]byte, 0)
+	// nolap
+	for i := 0; i < chunks-1; i++ {
+		off := int64(i * offset)
+		chunk := makeChunk(i, offset)
+		rb.WriteAt(chunk, off)
+		expected = append(expected, chunk...)
+	}
+	miniChunk = makeChunk(chunks, offset/2)
+	off = int64(offset * (chunks - 1))
+
+	expected = append(expected, miniChunk...)
+	rb.WriteAt(miniChunk, off)
+
+	if !bytes.Equal(result.Bytes(), expected) {
+		t.Errorf("Got: %v, expected: %v\n", result.Bytes(), expected)
+	}
+
+}
+
+func TestHalfFillWithTinyChunk(t *testing.T) {
+	offset, workerCount := 64, 5
+	//guaranteed buffer size
+	gbs := (workerCount * (workerCount + 1) / 2) + workerCount
+	var result bytes.Buffer
+	expected := make([]byte, 0)
+	rb := buffer.NewRingBuffer(gbs, workerCount*2, offset, &result)
+
+	// nolap
+	for i := 0; i < (workerCount*2)-1; i++ {
+		off := int64(i * offset)
+		chunk := makeChunk(i, offset)
+		rb.WriteAt(chunk, off)
+		expected = append(expected, chunk...)
+	}
+
+	// make the last chunk tiny
+	miniChunk := makeChunk(workerCount, offset/2)
+	off := int64(offset * ((workerCount * 2) - 1))
+
+	expected = append(expected, miniChunk...)
+	rb.WriteAt(miniChunk, off)
+
+	if !bytes.Equal(result.Bytes(), expected) {
+		t.Errorf("Got: %v, expected: %v\n", result.Bytes(), expected)
+	}
+}
