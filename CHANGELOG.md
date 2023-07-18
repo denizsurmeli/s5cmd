@@ -4,6 +4,7 @@
 
 #### Breaking changes
 #### Features
+-- Added `--show-fullpath` flag to `ls` command. ([#596](https://github.com/peak/s5cmd/issues/596))
 #### Improvements
 #### Bugfixes
 
